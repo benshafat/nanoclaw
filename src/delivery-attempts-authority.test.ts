@@ -126,6 +126,35 @@ describe('delivery attempts survive a restart', () => {
     expect(callCount).toBe(1);
   });
 
+  it('permanent give-up writes a failure notice into the session inbound', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-poison');
+    await seedPriorAttempts('out-poison', session.id, 2);
+
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error("Bad Request: can't parse entities");
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    // The agent was told "queued"; on give-up it must be told the message was
+    // dropped — with the error and an excerpt identifying which message.
+    const db = new Database(inboundDbPath('ag-1', session.id), { readonly: true });
+    const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get('dfail-out-poison') as
+      | { content: string }
+      | undefined;
+    db.close();
+    expect(row).toBeDefined();
+    const content = JSON.parse(row!.content) as { text: string; sender: string };
+    expect(content.sender).toBe('system');
+    expect(content.text).toContain('DELIVERY FAILED');
+    expect(content.text).toContain("can't parse entities");
+    expect(content.text).toContain('hello');
+  });
+
   it('a success after the restart clears the persisted count', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

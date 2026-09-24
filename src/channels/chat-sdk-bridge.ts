@@ -457,6 +457,32 @@ export function appendRawText(
   serialized.text = text ? `${text}\n\n${extra}` : extra;
 }
 
+/**
+ * Post a text message, falling back to the platform's raw/plain path when the
+ * platform rejects the rendered markup ("can't parse entities" — Telegram's
+ * MarkdownV2 rejection). That rejection is deterministic per message, so the
+ * delivery poll's retries can never succeed on it; without this fallback the
+ * message is silently lost after the retry budget (the 2026-09-24 incident).
+ * Delivery outranks formatting: the recipient gets the unformatted text, and
+ * the warn line is the operator's signal that the renderer produced bad
+ * markup. Scoped to that error string so genuine transient platform errors
+ * still take the normal retry path.
+ */
+export async function postTextWithPlainFallback(
+  adapter: Adapter,
+  tid: string,
+  payload: { markdown: string; files?: Array<{ data: Buffer; filename: string }> },
+) {
+  try {
+    return await adapter.postMessage(tid, payload);
+  } catch (err) {
+    if (!(err instanceof Error) || !/can't parse entities/i.test(err.message)) throw err;
+    log.warn('Platform rejected rendered markup — resending as plain text', { threadId: tid, err: err.message });
+    const { markdown, ...rest } = payload;
+    return await adapter.postMessage(tid, { ...rest, raw: markdown });
+  }
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -948,7 +974,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
+          const result = await postTextWithPlainFallback(
+            adapter,
             tid,
             attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
           );

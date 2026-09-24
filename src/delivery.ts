@@ -32,7 +32,7 @@ import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, readOutboxFiles, withExistingMailboxSession } from './session-manager.js';
+import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
@@ -348,6 +348,7 @@ async function drainSession(session: Session): Promise<void> {
             err: markErr,
           });
         }
+        await notifyDeliveryFailure(msg, session, err);
       } else {
         log.warn('Message delivery failed, will retry', {
           messageId: msg.id,
@@ -360,6 +361,63 @@ async function drainSession(session: Session): Promise<void> {
       }
     }
   }
+}
+
+/**
+ * Tell the sending session that a message it emitted was dropped after the
+ * retry budget. Without this, the agent's send tool reported "queued" (and
+ * historically "sent"), nothing ever contradicted it, and silent loss went
+ * unnoticed for days (the 2026-09-24 incident). The notice wakes the session
+ * so the agent can resend or escalate.
+ *
+ * Skips system rows (host-internal actions, not user-facing messages) and
+ * task_log rows (never channel-delivered). Best-effort: a notification
+ * failure only logs — it must never affect the delivery loop.
+ */
+async function notifyDeliveryFailure(
+  msg: { id: string; kind: string; platformId: string | null; channelType: string | null; content: string },
+  session: Session,
+  err: unknown,
+): Promise<void> {
+  if (msg.kind === 'system' || msg.kind === 'task_log') return;
+  let excerpt = '';
+  /* eslint-disable no-catch-all/no-catch-all -- notification is best-effort decoration on the failure path */
+  try {
+    const parsed = JSON.parse(msg.content) as { text?: unknown };
+    if (typeof parsed.text === 'string') {
+      excerpt = parsed.text.length > 160 ? `${parsed.text.slice(0, 160)}…` : parsed.text;
+    }
+  } catch {
+    // Unparseable content — the destination and error still identify the message.
+  }
+  const reason = err instanceof Error ? err.message : String(err);
+  try {
+    await writeSessionMessage(session.agent_group_id, session.id, {
+      id: `dfail-${msg.id}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({
+        text:
+          `DELIVERY FAILED — the recipient did NOT receive this message. ` +
+          `Destination: ${msg.channelType ?? 'unknown'}:${msg.platformId ?? 'unknown'}. ` +
+          `Error: ${reason}. ` +
+          (excerpt ? `The message began: "${excerpt}". ` : '') +
+          `It has been dropped and will not be retried. Resend it (reworded if the error points at formatting) or tell the user another way.`,
+        sender: 'system',
+        senderId: 'system',
+      }),
+    });
+  } catch (notifyErr) {
+    log.error('Failed to notify session of delivery failure', {
+      messageId: msg.id,
+      sessionId: session.id,
+      err: notifyErr,
+    });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 async function deliverMessage(

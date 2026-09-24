@@ -100,7 +100,9 @@ export const sendMessage: McpToolDefinition = {
     });
 
     log(`send_message: #${seq} → ${routing.resolvedName}`);
-    return ok(`Message sent to ${routing.resolvedName} (id: ${seq})`);
+    // "Queued", not "sent": delivery happens asynchronously on the host, and
+    // the host writes a system message back to this session if it fails.
+    return ok(`Message queued for delivery to ${routing.resolvedName} (id: ${seq})`);
   },
 };
 
@@ -149,7 +151,7 @@ export const sendFile: McpToolDefinition = {
     });
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
-    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
+    return ok(`File queued for delivery to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
   },
 };
 
