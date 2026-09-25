@@ -483,6 +483,19 @@ export async function postTextWithPlainFallback(
   }
 }
 
+/**
+ * Base64 for inbound attachment bytes. chat >= 4.41 declares
+ * `fetchData(): Promise<Buffer | ArrayBuffer>` and the Telegram adapter took
+ * the ArrayBuffer arm; calling `.toString('base64')` on an ArrayBuffer
+ * silently returns the literal string "[object ArrayBuffer]", which the
+ * host's attachment extractor then base64-decodes into a constant 12-byte
+ * stub — every inbound attachment corrupted with no error anywhere (the
+ * 2026-09-25 audio regression). Normalize to a Buffer before encoding.
+ */
+export function attachmentDataToBase64(data: Buffer | ArrayBuffer): string {
+  return (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString('base64');
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   // The instance name becomes a webhook route segment (the route regex is
@@ -530,8 +543,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         };
         if (att.fetchData) {
           try {
-            const buffer = await att.fetchData();
-            entry.data = buffer.toString('base64');
+            entry.data = attachmentDataToBase64(await att.fetchData());
           } catch (err) {
             log.warn('Failed to download attachment', { type: att.type, err });
           }
