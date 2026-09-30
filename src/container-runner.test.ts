@@ -164,6 +164,22 @@ describe('composeSessionSpec', () => {
     expect(spec.containers[0].contributedEnv?.HTTPS_PROXY).toBe('http://gateway-must-win:15001');
   });
 
+  it('exempts the container host from the injected proxy, both spellings', () => {
+    const spec = compose({
+      gateway: { env: { HTTPS_PROXY: 'http://x:secret@host.docker.internal:15001' } },
+    });
+    expect(spec.containers[0].contributedEnv?.NO_PROXY).toBe('host.docker.internal');
+    expect(spec.containers[0].contributedEnv?.no_proxy).toBe('host.docker.internal');
+  });
+
+  it('merges the host-gateway exemption into a contributed NO_PROXY without duplicating it', () => {
+    const spec = compose({
+      gateway: { env: { NO_PROXY: 'localhost,127.0.0.1', no_proxy: 'host.docker.internal' } },
+    });
+    expect(spec.containers[0].contributedEnv?.NO_PROXY).toBe('localhost,127.0.0.1,host.docker.internal');
+    expect(spec.containers[0].contributedEnv?.no_proxy).toBe('host.docker.internal');
+  });
+
   it('gateway mounts merge collision-free, shadowing a composed mount on the same target', () => {
     const spec = compose({
       gateway: {

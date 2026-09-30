@@ -1081,6 +1081,18 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
   };
+  // Traffic to the container host must bypass the credential proxy the gateway
+  // injects via HTTP(S)_PROXY: the proxy resolves host.docker.internal against
+  // its own network (or not at all), so a proxied request to a host-side
+  // service dies with an empty reply. This is what lets an operator-registered
+  // MCP server at http://host.docker.internal:<port> actually connect. Merge,
+  // never overwrite — a gateway that contributes its own NO_PROXY keeps its
+  // entries. Both spellings: curl and Node's env-proxy honor the lowercase one.
+  for (const key of ['NO_PROXY', 'no_proxy'] as const) {
+    const existing = contributedEnv[key];
+    if (existing?.split(',').includes('host.docker.internal')) continue;
+    contributedEnv[key] = existing ? `${existing},host.docker.internal` : 'host.docker.internal';
+  }
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
