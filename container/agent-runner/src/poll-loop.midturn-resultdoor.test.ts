@@ -337,12 +337,11 @@ describe('destination set changes between stream time and result time', () => {
     expect(nudges(pushes)).toHaveLength(1);
   });
 
-  it('KNOWN RESIDUAL (pinned): dest appears late while ANOTHER block already delivered — no delivery, no nudge', async () => {
-    // Accepted bound of the one-door contract: the turn DID deliver, so the
-    // nudge stays quiet, and the result door never sends — the late block is
-    // lost for this turn. Reaching this shape requires a destination write
-    // landing inside the sub-second window between the last streamed segment
-    // and the result, in a turn that also delivered another block.
+  it('dest appears late while ANOTHER block already delivered: no result-door send, the unknown-destination nudge fires', async () => {
+    // The turn DID deliver, so the wrap-nudge stays quiet, and the result
+    // door never sends. The block the door skipped is not lost: it draws the
+    // unknown-destination nudge, and a retry streams it to the now-known
+    // destination.
     seedDest('discord-main');
     const known = '<message to="discord-main">to the known channel</message>';
     const late = '<message to="late-dest">to the late channel</message>';
@@ -357,7 +356,55 @@ describe('destination set changes between stream time and result time', () => {
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
     expect(deliveredTexts()).toEqual(['to the known channel']);
-    expect(nudges(pushes)).toHaveLength(0);
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(nudges(pushes)[0]).toContain(
+      '<undelivered_message to="late-dest">to the late channel</undelivered_message>',
+    );
+  });
+
+  it('stale name after an acknowledgement: the answer is not lost — nudge names it, the retry delivers once', async () => {
+    seedDest();
+    const ack = '<message to="discord-main">About 5 minutes.</message>';
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: ack };
+      // The answer is addressed to a name that is not a destination.
+      const stale = '<message to="old-name">The answer.</message>';
+      yield { type: 'text', text: stale };
+      yield { type: 'result', text: stale };
+      // Retry: re-addressed to a real destination, acknowledgement not repeated.
+      const fixed = '<message to="discord-main">The answer.</message>';
+      yield { type: 'text', text: fixed };
+      yield { type: 'result', text: fixed };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(deliveredTexts()).toEqual(['About 5 minutes.', 'The answer.']);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('<undelivered_message to="old-name">The answer.</undelivered_message>');
+    expect(pushes[0]).toContain('must not be repeated');
+    expect(pushes[0]).toContain('Your destinations: discord-main.');
+  });
+
+  it('stale name before a trailing tool call (empty result): the unknown-destination nudge still fires, once', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="old-name">The answer.</message>' };
+      yield { type: 'result', text: '' };
+      // The retry repeats the stale name: no second nudge.
+      yield { type: 'text', text: '<message to="old-name">The answer.</message>' };
+      yield { type: 'result', text: '' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(deliveredTexts()).toEqual([]);
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(nudges(pushes)[0]).toContain('to="old-name"');
   });
 
   it('dest removed between stream and result: the delivered block is not re-sent and no nudge fires', async () => {
@@ -499,7 +546,7 @@ describe('cross-segment echo guard', () => {
 // ── MCP sends count as same-turn deliveries for the nudge decision ──
 
 describe('DB-visible sends gate the nudge', () => {
-  it('a chat row written this turn outside the door (MCP send_message shape) suppresses the nudge', async () => {
+  it('a chat row written this turn outside the door (MCP send_message shape) softens the nudge, never suppresses it', async () => {
     seedDest();
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 's1' };
@@ -514,8 +561,9 @@ describe('DB-visible sends gate the nudge', () => {
         thread_id: null,
         content: JSON.stringify({ text: 'sent via tool' }),
       });
-      // Final text is an unwrapped self-summary — with a DB-visible send
-      // this turn, nudging would coax a redundant repeat.
+      // Final text is unwrapped. It may be a self-summary or the real answer
+      // after an acknowledgement — the runtime cannot tell, so it asks, and
+      // tells the model not to repeat what the tool already sent.
       yield { type: 'result', text: 'Told them via the tool.' };
     }
     const { query, pushes } = makeStubQuery(events());
@@ -523,7 +571,9 @@ describe('DB-visible sends gate the nudge', () => {
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
     expect(deliveredTexts()).toEqual(['sent via tool']);
-    expect(nudges(pushes)).toHaveLength(0);
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(nudges(pushes)[0]).toContain('Told them via the tool.');
+    expect(nudges(pushes)[0]).toContain('must not be repeated');
   });
 });
 

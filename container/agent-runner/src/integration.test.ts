@@ -165,14 +165,18 @@ describe('poll loop integration', () => {
   it('unknown destination is dropped, valid destination is sent', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
 
-    const provider = new MockProvider(
-      {},
-      () => '<message to="nonexistent">dropped</message><message to="discord-test">delivered</message>',
+    // The dropped block draws the unknown-destination nudge; the model's
+    // answer to it here is that nothing more needs sending.
+    const provider = new MockProvider({}, (prompt) =>
+      prompt.includes('not one of your destinations')
+        ? '<internal>nothing to send</internal>'
+        : '<message to="nonexistent">dropped</message><message to="discord-test">delivered</message>',
     );
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await sleep(200);
     controller.abort();
 
     const out = getUndeliveredMessages();

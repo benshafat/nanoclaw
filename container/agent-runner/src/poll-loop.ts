@@ -409,6 +409,10 @@ export async function processQuery(
   // never re-matched. Dropped at the turn boundary: a block that never
   // closes anywhere is the wrap-nudge's job, not the buffer's.
   let midTurnTail = '';
+  // Blocks the mid-turn door skipped this turn because their `to` is not a
+  // destination. Frame-local and turn-local like midTurnSent; feeds the
+  // unknown-destination nudge at the result and resets with the turn.
+  let midTurnUnknown: TaskMessageBlock[] = [];
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt. Retries append the original user prompt at
   // their position in the provider input queue.
@@ -596,6 +600,13 @@ export async function processQuery(
           const scan = await deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
+          for (const block of scan.unknown) {
+            // The model often re-emits a block as its final text; one entry
+            // per distinct block is enough for the nudge.
+            if (!midTurnUnknown.some((seen) => seen.to === block.to && seen.body === block.body)) {
+              midTurnUnknown.push(block);
+            }
+          }
         }
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
@@ -607,8 +618,20 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         const resultText = event.text ?? '';
         const failed = event.isError === true;
+        // A block addressed to a name that is not a destination never
+        // delivers, whatever else the turn sent and whatever the final text
+        // says (it may be empty after a trailing tool call). Name the bad
+        // destination rather than leaving it to the generic nudges below,
+        // which stay quiet once this one has fired.
+        if (!failed && midTurnUnknown.length > 0 && !unwrappedNudged) {
+          unwrappedNudged = true;
+          const names = getAllDestinations()
+            .map((d) => d.name)
+            .join(', ');
+          pushRetry(buildUnknownDestinationNudge(midTurnUnknown, names));
+        }
         if (resultText || failed) {
-          const { hasUnwrapped, taskBlocks } = await dispatchResultText(resultText, routing, {
+          const { hasUnwrapped, unwrappedAfterDelivery, taskBlocks } = await dispatchResultText(resultText, routing, {
             midTurnSent,
             // For mid-turn delivery providers the result door NEVER delivers
             // content: mid-turn streaming is
@@ -639,11 +662,16 @@ export async function processQuery(
             // unwrapped model output and raw diagnostics remain private.
             await deliverErrorResult(routing, event.error ?? 'The agent run failed. Check the logs for details.');
           }
-          // An unwrapped final text only warrants the wrap-nudge when NOTHING
-          // was delivered this turn — hasUnwrapped already folds in the
-          // turn's mid-turn sent count. If a reply already went out as a
-          // mid-turn block, the unwrapped tail stays in the scratchpad log.
+          // An unwrapped final text warrants the wrap-nudge when NOTHING was
+          // delivered this turn — hasUnwrapped already folds in the turn's
+          // mid-turn sent count.
           const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged;
+          // Something did go out this turn, but the final text is bare prose
+          // with no <message> block of its own. That is the shape of an
+          // acknowledgement ("about 5 minutes") followed by an unwrapped
+          // answer: the earlier send must not hide the lost one. The model
+          // decides whether the tail was the answer or a closing note.
+          const willRetryTail = !failed && unwrappedAfterDelivery !== undefined && !unwrappedNudged;
           notifyExchangeComplete(onExchangeComplete, {
             prompt: archivePrompts[0] ?? initialPrompt,
             result: archivedResult,
@@ -660,6 +688,13 @@ export async function processQuery(
                 `Your destinations: ${names}. ` +
                 `Please re-send your response with the correct wrapping.</system>`,
             );
+          }
+          if (willRetryTail) {
+            unwrappedNudged = true;
+            const names = getAllDestinations()
+              .map((d) => d.name)
+              .join(', ');
+            pushRetry(buildUnwrappedTailNudge(unwrappedAfterDelivery, names));
           }
           if (willRetryTaskBlocks) {
             taskBlockNudged = true;
@@ -684,6 +719,7 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        midTurnUnknown = [];
         const next = queuedTurns.shift();
         if (next) adoptTurn(next);
         else answering = false;
@@ -850,8 +886,9 @@ const INTERNAL_SPAN_RE = /<internal\b[\s\S]*?<\/internal>/gi;
  * a mangled re-send of the final fragment). Chat runs only — in task runs
  * mid-turn blocks stay inert exactly like final-text blocks (one-door: only
  * the send_message tool delivers). Blocks inside an <internal> span are never
- * delivered. Blocks to unknown destinations are left for the result path,
- * which logs the drop into the scratchpad and lets the nudge decide.
+ * delivered. Blocks to unknown destinations are not delivered either; they
+ * are returned in `unknown` so processQuery can nudge the model to re-send
+ * them to a real destination.
  *
  * Cross-segment assembly: `carry` is the unresolved tail of the previous
  * text event (frame-local, turn-local — see midTurnTail in processQuery).
@@ -875,6 +912,8 @@ const INTERNAL_SPAN_RE = /<internal\b[\s\S]*?<\/internal>/gi;
 export interface MidTurnScanResult {
   delivered: number;
   tail: string;
+  /** Complete, non-empty blocks skipped because `to` is not a destination. */
+  unknown: TaskMessageBlock[];
 }
 
 export async function deliverMidTurnBlocks(
@@ -883,7 +922,7 @@ export async function deliverMidTurnBlocks(
   turnStartSeq?: number,
   carry = '',
 ): Promise<MidTurnScanResult> {
-  if (routing.taskRun) return { delivered: 0, tail: '' };
+  if (routing.taskRun) return { delivered: 0, tail: '', unknown: [] };
   const input = carry + text;
   const tailStart = unresolvedTailStart(input);
   const settled = input.slice(0, tailStart);
@@ -901,12 +940,19 @@ export async function deliverMidTurnBlocks(
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
   let match: RegExpExecArray | null;
   let delivered = 0;
+  const unknown: TaskMessageBlock[] = [];
   while ((match = MESSAGE_RE.exec(visible)) !== null) {
     const toName = match[1];
     const rawBody = match[2];
     const body = stripHarnessTagArtifacts(rawBody.trim());
     const dest = findByName(toName);
-    if (!dest) continue;
+    if (!dest) {
+      if (body) {
+        log(`Mid-turn <message to="${toName}"> has an unknown destination — not delivered`);
+        unknown.push({ to: toName, body });
+      }
+      continue;
+    }
     // Never deliver a blank message: a body that is empty (or was only
     // harness-tag artifacts) is skipped here; the result path logs it.
     if (!body) {
@@ -930,7 +976,7 @@ export async function deliverMidTurnBlocks(
     delivered++;
     log(`Mid-turn delivery: <message to="${toName}"> (${body.length} chars)`);
   }
-  return { delivered, tail };
+  return { delivered, tail, unknown };
 }
 
 const OPEN_INTERNAL_RE = /<internal\b/i;
@@ -1044,7 +1090,18 @@ export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
   options?: ResultDispatchOptions,
-): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] }> {
+): Promise<{
+  sent: number;
+  hasUnwrapped: boolean;
+  /**
+   * The bare final text of a chat turn that DID deliver something earlier
+   * (a mid-turn block or a send_message call) but whose final text carries no
+   * <message> block at all. Undefined otherwise. Drives the softer
+   * "was this meant to be sent?" nudge in processQuery.
+   */
+  unwrappedAfterDelivery?: string;
+  taskBlocks: TaskMessageBlock[];
+}> {
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1063,9 +1120,11 @@ export async function dispatchResultText(
   // "use send_message" nudge in processQuery.
   const taskBlocks: TaskMessageBlock[] = [];
   let lastIndex = 0;
+  let blocksSeen = 0;
   const scratchpadParts: string[] = [];
 
   while ((match = MESSAGE_RE.exec(text)) !== null) {
+    blocksSeen++;
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
@@ -1140,7 +1199,59 @@ export async function dispatchResultText(
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped, taskBlocks };
+  // A final text that carries a block of its own is a reply plus commentary,
+  // and one holding a bare open or close tag is the last fragment of a block
+  // the mid-turn door assembled. Only a tag-free tail after an earlier send
+  // can be a lost answer.
+  const tagFree = blocksSeen === 0 && !/<\/?message\b/.test(text);
+  const unwrappedAfterDelivery =
+    !routing.taskRun && anythingDelivered && tagFree && scratchpad ? scratchpad : undefined;
+  if (unwrappedAfterDelivery) {
+    log(`WARNING: final text after an earlier send had no <message to="..."> block — it was not sent`);
+  }
+  return { sent, hasUnwrapped, unwrappedAfterDelivery, taskBlocks };
+}
+
+/**
+ * Nudge for a chat turn that sent something earlier but ended on bare text.
+ * Softer than the plain wrap-nudge: the earlier send may have been the whole
+ * reply, so the model is asked to judge rather than told to re-send.
+ */
+export function buildUnwrappedTailNudge(text: string, destinationNames: string): string {
+  return (
+    '<system>The final text of your last turn was not delivered — it was not wrapped in <message to="name">...</message>:\n' +
+    `<undelivered_text>${escapePromptXml(nudgeExcerpt(text))}</undelivered_text>\n` +
+    'Messages you sent earlier in that turn were delivered and must not be repeated. ' +
+    'If this text was meant for the user, send it now, in full, wrapped in a <message to="name"> block. ' +
+    'If it was only a closing note to yourself, reply with <internal>nothing to send</internal>. ' +
+    `Your destinations: ${escapePromptXml(destinationNames)}.</system>`
+  );
+}
+
+/**
+ * Nudge for a chat turn that addressed one or more blocks to a name that is
+ * not a destination. Fires whether or not anything else was delivered.
+ */
+export function buildUnknownDestinationNudge(blocks: TaskMessageBlock[], destinationNames: string): string {
+  const listed = blocks
+    .map(
+      ({ to, body }) =>
+        `<undelivered_message to="${escapePromptXml(to)}">${escapePromptXml(nudgeExcerpt(body))}</undelivered_message>`,
+    )
+    .join('\n');
+  return (
+    '<system>The content below was not delivered — it was addressed to a name that is not one of your destinations:\n' +
+    `${listed}\n` +
+    'Anything you sent to a valid destination in that turn was delivered and must not be repeated. ' +
+    'If this content still needs to go out, send it now, in full, in a <message to="name"> block using one of your destinations. ' +
+    'If it does not, reply with <internal>nothing to send</internal>. ' +
+    `Your destinations: ${escapePromptXml(destinationNames)}.</system>`
+  );
+}
+
+/** The model has the full text in its own transcript; the nudge only needs enough to identify it. */
+function nudgeExcerpt(text: string): string {
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
 /**

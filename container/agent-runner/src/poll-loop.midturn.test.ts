@@ -120,12 +120,73 @@ describe('mid-turn <message> block delivery', () => {
     expect(pushes).toHaveLength(0);
   });
 
-  it('final bare text after a mid-turn delivery does not trigger the unwrapped nudge', async () => {
+  it('final bare text after a mid-turn delivery gets the soft tail nudge, once, and is never sent as-is', async () => {
     seedDest();
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 's1' };
-      yield { type: 'text', text: '<message to="discord-main">Sent mid-turn.</message>' };
-      yield { type: 'result', text: 'All done here.' };
+      // The acknowledgement goes out; the answer that follows is unwrapped.
+      yield { type: 'text', text: '<message to="discord-main">About 5 minutes.</message>' };
+      yield { type: 'result', text: 'Here are the seven matches, with two questions.' };
+      // The retry ends on bare text again: no second nudge.
+      yield { type: 'result', text: 'still bare' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(getUndeliveredMessages()).toHaveLength(1);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('was not delivered');
+    expect(pushes[0]).toContain('Here are the seven matches, with two questions.');
+    expect(pushes[0]).toContain('must not be repeated');
+  });
+
+  it('tail nudge recovery: the retry wraps the answer and it is delivered once, the acknowledgement is not repeated', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">About 5 minutes.</message>' };
+      yield { type: 'text', text: 'Here are the seven matches.' };
+      yield { type: 'result', text: 'Here are the seven matches.' };
+      const wrapped = '<message to="discord-main">Here are the seven matches.</message>';
+      yield { type: 'text', text: wrapped };
+      yield { type: 'result', text: wrapped };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(getUndeliveredMessages().map((m) => JSON.parse(m.content).text)).toEqual([
+      'About 5 minutes.',
+      'Here are the seven matches.',
+    ]);
+    expect(pushes).toHaveLength(1);
+  });
+
+  it('tail nudge opt-out: a retry answering <internal>nothing to send</internal> sends nothing and is not nudged again', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: '<message to="discord-main">Real reply.</message>' };
+      yield { type: 'result', text: 'Done.' };
+      yield { type: 'text', text: '<internal>nothing to send</internal>' };
+      yield { type: 'result', text: '<internal>nothing to send</internal>' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(getUndeliveredMessages().map((m) => JSON.parse(m.content).text)).toEqual(['Real reply.']);
+    expect(pushes).toHaveLength(1);
+  });
+
+  it('a final text that carries its own block plus a closing remark is not nudged', async () => {
+    seedDest();
+    const final = '<message to="discord-main">The answer.</message>\nDone.';
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      yield { type: 'text', text: final };
+      yield { type: 'result', text: final };
     }
     const { query, pushes } = makeStubQuery(events());
 
@@ -191,7 +252,7 @@ describe('mid-turn <message> block delivery', () => {
 
       // The follow-up's own turn: a fresh block still delivers.
       yield { type: 'text', text: '<message to="discord-main">Re: follow-up.</message>' };
-      yield { type: 'result', text: 'sent above' };
+      yield { type: 'result', text: '<internal>sent above</internal>' };
     }
     const query: AgentQuery = {
       push: (m: string) => {
@@ -223,7 +284,7 @@ describe('mid-turn <message> block delivery', () => {
       // keeps no memory of message content, so this must deliver — nothing
       // from turn 1 may swallow a genuine repeat.
       yield { type: 'text', text: block };
-      yield { type: 'result', text: 'sent above' };
+      yield { type: 'result', text: '<internal>sent above</internal>' };
     }
     const { query, pushes } = makeStubQuery(events());
 
@@ -239,10 +300,10 @@ describe('mid-turn <message> block delivery', () => {
   it('per-turn sent count resets: a later bare unwrapped turn still nudges after an earlier mid-turn send', async () => {
     seedDest();
     async function* events(): AsyncGenerator<ProviderEvent> {
-      // Turn 1: mid-turn delivery; bare final text is scratchpad (no nudge).
+      // Turn 1: mid-turn delivery, repeated as the final text (no nudge).
       yield { type: 'init', continuation: 's1' };
       yield { type: 'text', text: '<message to="discord-main">Sent mid-turn.</message>' };
-      yield { type: 'result', text: 'All done here.' };
+      yield { type: 'result', text: '<message to="discord-main">Sent mid-turn.</message>' };
       // Turn 2: no mid-turn block, bare unwrapped result. The per-turn sent
       // count was reset at the turn boundary, so the unwrapped-nudge must
       // fire — a stale count from turn 1 would silently suppress it.

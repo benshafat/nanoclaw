@@ -135,13 +135,15 @@ describe('mid-turn <internal> exclusion', () => {
 });
 
 describe('unwrapped final summary after a delivered reply', () => {
-  it('does not fire the wrap-nudge or deliver the summary when a block already went out', async () => {
+  it('never delivers the summary as-is; asks once whether it was meant to be sent', async () => {
     seedDest();
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 's1' };
       yield { type: 'text', text: '<message to="discord-main">Real reply.</message>' };
-      // Unwrapped self-summary as the final text — the live-observed shape
-      // that used to trigger the wrap-nudge and a redundant second message.
+      // Unwrapped self-summary as the final text. The plain wrap-nudge used
+      // to coax a redundant second message here; staying silent instead lost
+      // real answers that followed an acknowledgement. The tail nudge asks,
+      // and tells the model not to repeat what was already sent.
       yield { type: 'result', text: 'Flagged it to Joe rather than guessing.' };
     }
     const { query, pushes } = makeStubQuery(events());
@@ -149,7 +151,10 @@ describe('unwrapped final summary after a delivered reply', () => {
     await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
 
     expect(deliveredTexts()).toEqual(['Real reply.']);
-    expect(pushes.filter((p) => p.includes('was not delivered'))).toEqual([]);
+    const tailNudges = pushes.filter((p) => p.includes('was not delivered'));
+    expect(tailNudges).toHaveLength(1);
+    expect(tailNudges[0]).toContain('must not be repeated');
+    expect(tailNudges[0]).toContain('<internal>nothing to send</internal>');
   });
 
   it('still nudges when nothing at all was delivered', async () => {
